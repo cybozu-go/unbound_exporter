@@ -15,6 +15,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -28,6 +29,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"sort"
 
@@ -35,6 +37,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -469,6 +472,7 @@ func (e *UnboundExporter) Collect(ch chan<- prometheus.Metric) {
 func main() {
 	var (
 		listenAddress = flag.String("web.listen-address", ":9167", "Address to listen on for web interface and telemetry.")
+		reusePort     = flag.Bool("web.reuse-port", false, "Add SO_REUSEPORT to listen socket.")
 		metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 		unboundHost   = flag.String("unbound.host", "tcp://localhost:8953", "Unix or TCP address of Unbound control socket.")
 		unboundCa     = flag.String("unbound.ca", "/etc/unbound/unbound_server.pem", "Unbound server certificate.")
@@ -496,6 +500,26 @@ func main() {
 			</html>`))
 	})
 	_ = level.Info(log).Log("Listening on address:port => ", *listenAddress)
-	_ = level.Error(log).Log(http.ListenAndServe(*listenAddress, nil))
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var operr error
+			fn := func(s uintptr) {
+				if *reusePort {
+					operr = unix.SetsockoptInt(int(s), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				}
+			}
+			err := c.Control(fn)
+			if err != nil {
+				return err
+			}
+			return operr
+		},
+	}
+	l, err := lc.Listen(context.Background(), "tcp", *listenAddress)
+	_ = level.Error(log).Log(err)
+	if err != nil {
+		os.Exit(1)
+	}
+	_ = level.Error(log).Log(http.Serve(l, nil))
 	os.Exit(1)
 }
